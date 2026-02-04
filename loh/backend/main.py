@@ -1,6 +1,16 @@
+import os
+from dotenv import load_dotenv
+
+load_dotenv(
+    dotenv_path=os.path.join(os.path.dirname(__file__), ".env"),
+    override=True,
+    encoding="utf-8-sig",
+)
+
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
+from sqlalchemy import text
 from datetime import timedelta
 from typing import List, Optional
 
@@ -22,6 +32,40 @@ from auth import (
 
 # Initialize database tables
 Base.metadata.create_all(bind=engine)
+
+
+def _ensure_user_profile_columns():
+    # Best-effort schema alignment for development environments.
+    # Avoids requiring manual migrations just to store phone/address.
+    try:
+        with engine.connect() as conn:
+            # phone
+            phone_exists = conn.execute(
+                text(
+                    "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS "
+                    "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'users' AND COLUMN_NAME = 'phone'"
+                )
+            ).scalar()
+            if not phone_exists:
+                conn.execute(text("ALTER TABLE users ADD COLUMN phone VARCHAR(50) NULL"))
+
+            # address
+            address_exists = conn.execute(
+                text(
+                    "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS "
+                    "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'users' AND COLUMN_NAME = 'address'"
+                )
+            ).scalar()
+            if not address_exists:
+                conn.execute(text("ALTER TABLE users ADD COLUMN address TEXT NULL"))
+
+            conn.commit()
+    except Exception:
+        # If this fails, the app can still run; user can add columns manually.
+        pass
+
+
+_ensure_user_profile_columns()
 
 app = FastAPI()
 
@@ -74,6 +118,27 @@ async def register(user: UserCreate, db: Session = Depends(get_db)):
 
 @app.get("/users/me", response_model=UserOut)
 async def read_users_me(current_user: UserOut = Depends(get_current_user)):
+    return current_user
+
+
+class UserUpdate(BaseModel):
+    phone: Optional[str] = None
+    address: Optional[str] = None
+
+
+@app.put("/users/me", response_model=UserOut)
+async def update_users_me(
+    payload: UserUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if payload.phone is not None:
+        current_user.phone = payload.phone
+    if payload.address is not None:
+        current_user.address = payload.address
+    db.add(current_user)
+    db.commit()
+    db.refresh(current_user)
     return current_user
 
 

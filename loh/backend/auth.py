@@ -12,8 +12,10 @@ from sqlalchemy.orm import Session
 from database import get_db, User, SessionLocal
 
 # Setup Password Context
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+
+MAX_PASSWORD_BYTES = 1024
 
 # Secret key and algorithm (You should use environment variables in production)
 SECRET_KEY = "your-secret-key-here-keep-it-safe"
@@ -37,16 +39,32 @@ class UserCreate(UserBase):
 
 class UserOut(UserBase):
     full_name: Union[str, None] = None
+    phone: Union[str, None] = None
+    address: Union[str, None] = None
     id: int
 
     class Config:
         from_attributes = True
 
 # Helper Functions
+def _password_too_long(password: str) -> bool:
+    try:
+        return len((password or "").encode("utf-8")) > MAX_PASSWORD_BYTES
+    except Exception:
+        return True
+
+
 def verify_password(plain_password, hashed_password):
+    if _password_too_long(plain_password):
+        return False
     return pwd_context.verify(plain_password, hashed_password)
 
 def get_password_hash(password):
+    if _password_too_long(password):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Password terlalu panjang (maks {MAX_PASSWORD_BYTES} bytes). Gunakan password yang lebih pendek.",
+        )
     return pwd_context.hash(password)
 
 def create_access_token(data: dict, expires_delta: Union[timedelta, None] = None):

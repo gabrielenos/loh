@@ -1,193 +1,141 @@
-
 import os
+import logging
+from dotenv import load_dotenv
+
+_DOTENV_PATH = os.path.join(os.path.dirname(__file__), ".env")
+load_dotenv(dotenv_path=_DOTENV_PATH, override=True, encoding="utf-8-sig")
+
+_key = os.getenv("GROQ_API_KEY")
+logging.warning(
+    "dotenv loaded from %s (exists=%s). GROQ_API_KEY present=%s len=%s",
+    _DOTENV_PATH,
+    os.path.exists(_DOTENV_PATH),
+    bool(_key),
+    (len(_key) if _key else 0),
+)
+
 import json
 import urllib.request
 import urllib.error
+import re
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-from sqlalchemy.orm import Session
-
-from database import get_db, Product
 
 
 router = APIRouter(prefix="/ai", tags=["ai"])
 
 
-class AiModelInfo(BaseModel):
-    name: str
-    supported_generation_methods: list[str] = []
+def _is_greeting(text: str) -> bool:
+    normalized = " ".join((text or "").lower().split()).strip()
+    if not normalized:
+        return False
+
+    normalized = re.sub(r"[^\w\s]", "", normalized)
+    if not normalized:
+        return False
+
+    first = normalized.split(" ", 1)[0]
+    return first in {"hai", "halo", "hi", "hello", "hei", "hey", "hallo"}
 
 
-class AiModelsResponse(BaseModel):
-    api_versions_tried: list[str]
-    models: list[AiModelInfo]
+class AiSupportRequest(BaseModel):
+    message: str
 
 
-class AiProductRequest(BaseModel):
-    intent: Optional[str] = None
-
-
-class AiProductResponse(BaseModel):
-    product_id: int
-    title: str
+class AiSupportResponse(BaseModel):
     answer: str
 
 
-def _call_gemini(prompt: str) -> str:
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        raise HTTPException(status_code=500, detail="GEMINI_API_KEY is not set")
+APP_SUPPORT_SYSTEM_PROMPT = (
+    "Kamu adalah asisten customer support untuk aplikasi marketplace . "
+    "Tugasmu membantu user memahami aplikasi dan menyelesaikan masalah. "
+    "Jawab dalam Bahasa Indonesia yang natural, ringkas, dan jelas. "
+    "Jika user bertanya di luar konteks aplikasi, arahkan kembali ke topik aplikasi. "
+    "Jika butuh data yang tidak tersedia, tanyakan klarifikasi (mis. email akun, order id).\n\n"
+    "Jangan awali jawaban dengan kalimat seperti 'Selamat datang di aplikasi marketplace kami!'.\n\n"
+    "Topik yang bisa kamu bantu:\n"
+    "- Fitur aplikasi (login, signup, dashboard, chat AI rekomendasi).\n"
+    "- Produk: membantu memilih produk berdasarkan kebutuhan user (tanpa mengarang detail produk).\n"
+    "- Masalah pembelian/pesanan: status pesanan, pembayaran gagal, refund (beri langkah umum dan apa yang perlu dicek).\n"
+    "- Akun: cara ganti email, lupa password, logout (beri langkah dan peringatan keamanan).\n\n"
+    "Aturan:\n"
+    "- Jangan minta data sensitif seperti password/OTP.\n"
+    "- Jangan klaim ada fitur yang belum disebut user.\n"
+)
 
-    model = os.getenv("GEMINI_MODEL") or "gemini-1.5-flash-latest"
-    if model.startswith("models/"):
-        model = model.split("/", 1)[1]
-    api_version = os.getenv("GEMINI_API_VERSION")
-    versions_to_try = [api_version] if api_version else ["v1beta", "v1"]
+
+def _call_groq(prompt: str, system_prompt: str) -> str:
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=500, detail="GROQ_API_KEY is not set")
+
+    model = os.getenv("GROQ_MODEL") or "llama3-8b-8192"
+    base_url = os.getenv("GROQ_BASE_URL") or "https://api.groq.com/openai/v1"
+    url = f"{base_url.rstrip('/')}/chat/completions"
 
     payload = {
-        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "temperature": 0.4,
-            "maxOutputTokens": 350,
-        },
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": system_prompt,
+            },
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.4,
+        "max_tokens": 350,
     }
 
-    last_http_error = None
-    last_http_body = ""
-    for ver in versions_to_try:
-        url = (
-            f"https://generativelanguage.googleapis.com/{ver}/models/"
-            f"{model}:generateContent?key={api_key}"
-        )
-        req = urllib.request.Request(
-            url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "User-Agent": "Mozilla/5.0",
+        },
+        method="POST",
+    )
 
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as e:
+        body = ""
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                raw = resp.read().decode("utf-8")
-            break
-        except urllib.error.HTTPError as e:
-            last_http_error = e
-            last_http_body = e.read().decode("utf-8") if hasattr(e, "read") else ""
-            raw = ""
-
-            if e.code == 429:
-                raise HTTPException(
-                    status_code=429,
-                    detail=(
-                        f"Gemini quota/rate limit (429): {last_http_body} "
-                        "(Solusi: cek quota/billing di Google AI Studio/Cloud, atau tunggu sesuai retryDelay.)"
-                    ),
-                )
-
-            continue
-        except Exception as e:
-            raise HTTPException(status_code=502, detail=f"Gemini request failed: {str(e)}")
-
-    if not raw:
-        if last_http_error is not None:
-            raise HTTPException(
-                status_code=502,
-                detail=(
-                    f"Gemini HTTPError: {last_http_error.code} {last_http_body} "
-                    "(Tip: buka /ai/models untuk lihat model yang tersedia, lalu set GEMINI_MODEL.)"
-                ),
-            )
-        raise HTTPException(status_code=502, detail="Gemini request failed")
+            body = e.read().decode("utf-8") if hasattr(e, "read") else ""
+        except Exception:
+            body = ""
+        if e.code == 429:
+            raise HTTPException(status_code=429, detail=f"Groq quota/rate limit (429): {body}")
+        raise HTTPException(status_code=502, detail=f"Groq HTTPError: {e.code} {body}")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Groq request failed: {str(e)}")
 
     data = json.loads(raw)
     try:
-        return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        return data["choices"][0]["message"]["content"].strip()
     except Exception:
-        raise HTTPException(status_code=502, detail="Gemini response format unexpected")
+        raise HTTPException(status_code=502, detail="Groq response format unexpected")
 
 
-@router.get("/models", response_model=AiModelsResponse)
-def list_gemini_models():
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        raise HTTPException(status_code=500, detail="GEMINI_API_KEY is not set")
+@router.post("/support", response_model=AiSupportResponse)
+def ai_support(payload: AiSupportRequest):
+    message = (payload.message or "").strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="message is required")
 
-    api_version = os.getenv("GEMINI_API_VERSION")
-    versions_to_try = [api_version] if api_version else ["v1beta", "v1"]
-
-    all_models: list[AiModelInfo] = []
-    for ver in versions_to_try:
-        url = f"https://generativelanguage.googleapis.com/{ver}/models?key={api_key}"
-        req = urllib.request.Request(url, method="GET")
-        try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                raw = resp.read().decode("utf-8")
-            data = json.loads(raw)
-            for m in data.get("models", []) or []:
-                name = m.get("name")
-                if name:
-                    methods = m.get("supportedGenerationMethods") or []
-                    all_models.append(
-                        AiModelInfo(
-                            name=str(name),
-                            supported_generation_methods=[str(x) for x in methods if x is not None],
-                        )
-                    )
-        except urllib.error.HTTPError:
-            continue
-        except Exception:
-            continue
-
-    unique: dict[str, AiModelInfo] = {}
-    for m in all_models:
-        existing = unique.get(m.name)
-        if existing is None:
-            unique[m.name] = m
-        else:
-            merged = sorted(
-                list(
-                    {
-                        *existing.supported_generation_methods,
-                        *m.supported_generation_methods,
-                    }
-                )
+    if _is_greeting(message):
+        return AiSupportResponse(
+            answer=(
+                "Halo! Bisa saya bantu? Kamu bisa tanya tentang fitur aplikasi, produk, masalah pembelian/pesanan, "
+                "atau pengaturan akun seperti ganti email."
             )
-            unique[m.name] = AiModelInfo(name=m.name, supported_generation_methods=merged)
+        )
 
-    models_sorted = [unique[k] for k in sorted(unique.keys())]
-    if not models_sorted:
-        raise HTTPException(status_code=502, detail="Could not list models for this API key")
-
-    return AiModelsResponse(api_versions_tried=versions_to_try, models=models_sorted)
-
-
-@router.post("/product/{product_id}", response_model=AiProductResponse)
-def ai_product(product_id: int, payload: AiProductRequest, db: Session = Depends(get_db)):
-    product = db.query(Product).filter(Product.id == product_id).first()
-    if not product:
-        raise HTTPException(status_code=404, detail="Product not found")
-
-    intent = (payload.intent or "").strip()
-    description = product.description or ""
-    details = product.details_json or "{}"
-
-    prompt = (
-        "Kamu adalah asisten marketplace. Jawab dalam Bahasa Indonesia, ringkas dan jelas. "
-        "Gunakan data produk di bawah ini sebagai sumber utama. Jangan mengarang detail teknis yang tidak ada.\n\n"
-        f"Nama Produk: {product.title}\n"
-        f"Deskripsi: {description}\n"
-        f"Detail(JSON): {details}\n\n"
-        "Tugas:\n"
-        "1) Ringkas produk ini (2-3 kalimat).\n"
-        "2) Sebutkan 3 poin kelebihan.\n"
-        "3) Sebutkan 1-2 hal yang perlu diperhatikan (mis. peringatan/cocok_untuk).\n"
-    )
-
-    if intent:
-        prompt += f"\nKebutuhan user: {intent}\n"
-
-    answer = _call_gemini(prompt)
-    return AiProductResponse(product_id=product.id, title=product.title, answer=answer)
-
+    answer = _call_groq(message, APP_SUPPORT_SYSTEM_PROMPT).strip()
+    answer = answer.replace("Selamat datang di aplikasi marketplace kami!", "").lstrip(" \n\t")
+    return AiSupportResponse(answer=answer)

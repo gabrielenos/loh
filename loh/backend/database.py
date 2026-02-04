@@ -20,6 +20,8 @@ class User(Base):
     email = Column(String(255), unique=True, index=True)
     hashed_password = Column(String(255))
     full_name = Column(String(255), nullable=True)
+    phone = Column(String(50), nullable=True)
+    address = Column(Text, nullable=True)
 
 
 class Product(Base):
