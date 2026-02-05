@@ -40,6 +40,29 @@ def _is_greeting(text: str) -> bool:
     return first in {"hai", "halo", "hi", "hello", "hei", "hey", "hallo"}
 
 
+def _product_detail_category(text: str) -> Optional[str]:
+    normalized = " ".join((text or "").lower().split()).strip()
+    if not normalized:
+        return None
+
+    buckets = {
+        "material": {"bahan", "material"},
+        "size": {"ukuran", "size"},
+        "color": {"warna"},
+        "variant": {"varian"},
+        "spec": {"spesifikasi", "spec", "detail produk"},
+        "authenticity": {"original", "ori"},
+        "warranty": {"garansi"},
+        "stock": {"stok", "ready", "preorder", "pre order"},
+        "expiry": {"expired", "kadaluarsa"},
+    }
+
+    for category, keys in buckets.items():
+        if any(k in normalized for k in keys):
+            return category
+    return None
+
+
 class AiSupportRequest(BaseModel):
     message: str
 
@@ -57,7 +80,7 @@ APP_SUPPORT_SYSTEM_PROMPT = (
     "Jangan awali jawaban dengan kalimat seperti 'Selamat datang di aplikasi marketplace kami!'.\n\n"
     "Topik yang bisa kamu bantu:\n"
     "- Fitur aplikasi (login, signup, dashboard, chat AI rekomendasi).\n"
-    "- Produk: membantu memilih produk berdasarkan kebutuhan user (tanpa mengarang detail produk).\n"
+    "- Produk: kamu tidak memberikan detail spesifik produk (spesifikasi/ukuran/warna/stok/garansi). Untuk detail produk, arahkan user untuk bertanya langsung ke seller/penjual.\n"
     "- Masalah pembelian/pesanan: status pesanan, pembayaran gagal, refund (beri langkah umum dan apa yang perlu dicek).\n"
     "- Akun: cara ganti email, lupa password, logout (beri langkah dan peringatan keamanan).\n\n"
     "Aturan:\n"
@@ -133,6 +156,35 @@ def ai_support(payload: AiSupportRequest):
             answer=(
                 "Halo! Bisa saya bantu? Kamu bisa tanya tentang fitur aplikasi, produk, masalah pembelian/pesanan, "
                 "atau pengaturan akun seperti ganti email."
+            )
+        )
+
+    category = _product_detail_category(message)
+    if category:
+        detail_hint = "detail produk"
+        if category == "material":
+            detail_hint = "detail bahan/material"
+        elif category == "size":
+            detail_hint = "detail ukuran/size"
+        elif category == "color":
+            detail_hint = "detail warna"
+        elif category == "variant":
+            detail_hint = "detail varian"
+        elif category == "spec":
+            detail_hint = "detail spesifikasi"
+        elif category == "authenticity":
+            detail_hint = "info original/keaslian"
+        elif category == "warranty":
+            detail_hint = "detail garansi"
+        elif category == "stock":
+            detail_hint = "info stok/ready/preorder"
+        elif category == "expiry":
+            detail_hint = "info expired/kadaluarsa"
+
+        return AiSupportResponse(
+            answer=(
+                f"Untuk {detail_hint}, sebaiknya kamu tanyakan langsung ke seller/penjual di halaman produk ya.\n\n"
+                "Kalau kamu mau, aku bisa bantu cara pesan produk, cara bayar, atau cek status pesanan di aplikasi."
             )
         )
 
